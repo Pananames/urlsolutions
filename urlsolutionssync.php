@@ -1,46 +1,59 @@
 <?php
+
+use WHMCS\Database\Capsule;
+
 require dirname(dirname(dirname(dirname(__FILE__)))) . '/init.php';
 require dirname(dirname(dirname(dirname(__FILE__)))) . '/includes/functions.php';
 require dirname(dirname(dirname(dirname(__FILE__)))) . '/includes/registrarfunctions.php';
 
-spl_autoload_register(function($class) {
-	include 'lib/' . $class . '.php';
+spl_autoload_register(function ($class) {
+    include 'lib/' . $class . '.php';
 });
 
 $log = 'UrlSolutions Log: <br/>';
+ini_set('memory_limit', '1024M');
 
 $params = getregistrarconfigoptions('urlsolutions');
-$domainApi = new Domain($params['api_url'], $params['api_signature']);
+$domainApi = new UrlSolutions\Domain($params['api_url'], $params['api_signature']);
 
-$domains = select_query('tbldomains', 'domain', "registrar = 'urlsolutions' AND (status = 'Active' OR status = 'Pending Transfer')");
+$paged = 1000;
 
-// Pull info for each domain and sync it.
-while($item = mysql_fetch_array($domains)) {
-	$logDomain = "{$item['domain']}: ";
+$domainsQuery = Capsule::table('tbldomains')
+    ->select(['id', 'domain'])
+    ->where('registrar', '=', 'urlsolutions')
+    ->whereIn('status', ['Active', 'Pending Transfer']);
+$domainsCount = $domainsQuery->count();
 
-	try {
-		$request = $domainApi->getListOfDomains(['domain_like' => trim($item['domain'])]);
-		$data = $request['data'][0];
+for ($page = 0; $page < ceil($domainsCount/$paged); $page++) {
+    $domains = $domainsQuery->offset($page * $paged)->limit($paged)->get();
+    foreach ($domains as $item) {
+        echo '#' . $item->id . ' ' . $item->domain . PHP_EOL;
+        try {
+            $data = $domainApi->getInfo(trim($item->domain));
 
-		if ($data['status'] == 'ok') {
-			update_query('tbldomains', ['status' => 'Active'], ['domain' => $item['domain']]);
-		}
+            if (empty($data['status'])) {
+				echo 'Server has no such domains.' . PHP_EOL;
+                continue;
+            }
 
-		$expiryDate = $data['expiration_date'];
-		$date = date('Y-m-d', strtotime($expiryDate));
+			echo 'status: ' . $data['status'] . PHP_EOL;
 
-		if (!empty($expiryDate)) {
-			$updateDateQuery = update_query('tbldomains', ['nextduedate' => $date, 'expirydate' => $date], ['domain' => $item['domain']]);
-			$logDomain .= $updateDateQuery ? "- Update expiry date & Next Due Date to {$date}.\r\n<br/>" : "- ERROR: Problem with updating the expiry date.\r\n<br/>";
-		}
+            if ($data['status'] == 'ok') {
+                Capsule::table('tbldomains')
+                    ->where('id', $item->id)
+                    ->update(['status' => 'Active']);
+            }
 
-	} catch(Exception $e) {
-		$logDomain .= '- ' . $e->getMessage() . '\n';
-	}
+            if (empty($data['expiration_date']) || !($expiryDate = strtotime($data['expiration_date']))) {
+                continue;
+            }
 
-	$log .= empty($logDomain) ? 'OK!' : $logDomain;
+            $date = date('Y-m-d', $expiryDate);
+            Capsule::table('tbldomains')
+                ->where('id', $item->id)
+                ->update(['nextduedate' => $date, 'expirydate' => $date]);
+        } catch (Exception $e) {
+            echo ' - Error: ' . $e->getMessage() . PHP_EOL;
+        }
+    }
 }
-
-// Logs.
-logactivity('UrlSolutions Sync');
-sendadminnotification('system', 'WHMCS UrlSolutions Syncronization Report', $log);
